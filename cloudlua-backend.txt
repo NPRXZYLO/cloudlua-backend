@@ -1,0 +1,280 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Database connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Create tables
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      api_key TEXT PRIMARY KEY,
+      name TEXT,
+      email TEXT,
+      password TEXT,
+      plan TEXT,
+      plan_price TEXT,
+      key_limit INTEGER,
+      is_admin BOOLEAN DEFAULT false,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS scripts (
+      id SERIAL PRIMARY KEY,
+      user_api_key TEXT REFERENCES users(api_key),
+      name TEXT,
+      original_code TEXT,
+      obfuscated_code TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS license_keys (
+      id TEXT PRIMARY KEY,
+      user_api_key TEXT REFERENCES users(api_key),
+      script_id INTEGER REFERENCES scripts(id),
+      key TEXT,
+      url_id TEXT UNIQUE,
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS executions (
+      id TEXT PRIMARY KEY,
+      key_id TEXT REFERENCES license_keys(id),
+      user_api_key TEXT,
+      script_id INTEGER,
+      hwid TEXT,
+      timestamp TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS blacklist (
+      id TEXT PRIMARY KEY,
+      user_api_key TEXT REFERENCES users(api_key),
+      target TEXT,
+      reason TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('Database tables ready');
+}
+initDB();
+
+// Helper functions
+function generateKey(prefix = 'CL-', length = 18) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = prefix;
+  for (let i = 0; i < length; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+  return result;
+}
+
+// Routes
+
+// 1. User registration (purchase simulation)
+app.post('/api/register', async (req, res) => {
+  const { plan } = req.body;  // plan: Basic, Pro, Max
+  try {
+    const apiKey = generateKey('CL-', 16);
+    const limits = { Basic: 400, Pro: 1000, Max: Infinity };
+    const prices = { Basic: '$12/mo', Pro: '$25/mo', Max: '$50/mo' };
+    await pool.query(
+      'INSERT INTO users (api_key, plan, plan_price, key_limit) VALUES ($1, $2, $3, $4)',
+      [apiKey, plan, prices[plan], limits[plan]]
+    );
+    res.json({ apiKey });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Login (verify API key and return user)
+app.post('/api/login', async (req, res) => {
+  const { apiKey } = req.body;
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid key' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. Obfuscate and save script (client-side obfuscation still works, but we store it)
+app.post('/api/scripts', async (req, res) => {
+  const { apiKey, name, originalCode, obfuscatedCode } = req.body;
+  try {
+    const user = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
+    if (user.rows.length === 0) return res.status(401).json({ error: 'Invalid API key' });
+    const result = await pool.query(
+      'INSERT INTO scripts (user_api_key, name, original_code, obfuscated_code) VALUES ($1, $2, $3, $4) RETURNING id',
+      [apiKey, name, originalCode, obfuscatedCode]
+    );
+    res.json({ id: result.rows[0].id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. Get all scripts for user
+app.get('/api/scripts', async (req, res) => {
+  const { apiKey } = req.query;
+  try {
+    const result = await pool.query('SELECT * FROM scripts WHERE user_api_key = $1 ORDER BY created_at DESC', [apiKey]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 5. Edit script (update code and re-obfuscate)
+app.put('/api/scripts/:id', async (req, res) => {
+  const { id } = req.params;
+  const { apiKey, name, originalCode, obfuscatedCode } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE scripts SET name = $1, original_code = $2, obfuscated_code = $3 WHERE id = $4 AND user_api_key = $5',
+      [name, originalCode, obfuscatedCode, id, apiKey]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 6. Generate license key
+app.post('/api/keys', async (req, res) => {
+  const { apiKey, scriptId } = req.body;
+  try {
+    const user = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
+    if (user.rows.length === 0) return res.status(401).json({ error: 'Invalid API key' });
+    // Check key limit
+    const currentKeys = await pool.query('SELECT COUNT(*) FROM license_keys WHERE user_api_key = $1', [apiKey]);
+    const limit = user.rows[0].key_limit === Infinity ? Infinity : parseInt(user.rows[0].key_limit);
+    if (currentKeys.rows[0].count >= limit) return res.status(400).json({ error: 'Key limit reached' });
+    const keyId = 'key-' + Date.now();
+    const keyString = generateKey('CLK-', 20);
+    const urlId = Math.random().toString(36).substring(2, 10);
+    await pool.query(
+      'INSERT INTO license_keys (id, user_api_key, script_id, key, url_id) VALUES ($1, $2, $3, $4, $5)',
+      [keyId, apiKey, scriptId, keyString, urlId]
+    );
+    res.json({ id: keyId, key: keyString, urlId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 7. Get keys for user
+app.get('/api/keys', async (req, res) => {
+  const { apiKey } = req.query;
+  try {
+    const result = await pool.query(
+      'SELECT * FROM license_keys WHERE user_api_key = $1 ORDER BY created_at DESC',
+      [apiKey]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 8. Toggle key active status
+app.put('/api/keys/:id/toggle', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query('UPDATE license_keys SET active = NOT active WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 9. Delete key
+app.delete('/api/keys/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query('DELETE FROM license_keys WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 10. Blacklist
+app.post('/api/blacklist', async (req, res) => {
+  const { apiKey, target, reason } = req.body;
+  try {
+    await pool.query(
+      'INSERT INTO blacklist (id, user_api_key, target, reason) VALUES ($1, $2, $3, $4)',
+      ['bl-' + Date.now(), apiKey, target, reason]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 11. Remove blacklist
+app.delete('/api/blacklist/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query('DELETE FROM blacklist WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 12. *** LOADSTRING ENDPOINT ***
+app.get('/s/:urlId', async (req, res) => {
+  const { urlId } = req.params;
+  const { key, hwid } = req.query;  // key = the license key, hwid = hardware ID
+  try {
+    const keyResult = await pool.query('SELECT * FROM license_keys WHERE url_id = $1', [urlId]);
+    if (keyResult.rows.length === 0) return res.status(404).send('Script not found');
+    const licenseKey = keyResult.rows[0];
+    if (!licenseKey.active) return res.status(403).send('Key revoked');
+    if (key !== licenseKey.key) return res.status(401).send('Invalid key');
+    
+    // Check blacklist
+    const blacklistResult = await pool.query(
+      'SELECT * FROM blacklist WHERE user_api_key = $1 AND target = $2',
+      [licenseKey.user_api_key, hwid]
+    );
+    if (blacklistResult.rows.length > 0) return res.status(403).send('HWID blacklisted');
+    
+    // Record execution
+    await pool.query(
+      'INSERT INTO executions (id, key_id, user_api_key, script_id, hwid) VALUES ($1, $2, $3, $4, $5)',
+      ['exec-' + Date.now(), licenseKey.id, licenseKey.user_api_key, licenseKey.script_id, hwid]
+    );
+    
+    // Return obfuscated script
+    const scriptResult = await pool.query('SELECT obfuscated_code FROM scripts WHERE id = $1', [licenseKey.script_id]);
+    if (scriptResult.rows.length === 0) return res.status(404).send('Script missing');
+    res.type('text/plain').send(scriptResult.rows[0].obfuscated_code);
+  } catch (err) {
+    res.status(500).send('Server error');
+  }
+});
+
+// 13. Get executions (for dashboard)
+app.get('/api/executions', async (req, res) => {
+  const { apiKey } = req.query;
+  try {
+    const result = await pool.query(
+      'SELECT executions.*, license_keys.key as key_string FROM executions JOIN license_keys ON executions.key_id = license_keys.id WHERE executions.user_api_key = $1 ORDER BY timestamp DESC LIMIT 50',
+      [apiKey]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`CloudLua backend running on port ${PORT}`));
