@@ -7,13 +7,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Database connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Create tables
+// -------------- DB INIT --------------
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -21,9 +20,8 @@ async function initDB() {
       name TEXT,
       email TEXT,
       password TEXT,
-      plan TEXT,
-      plan_price TEXT,
-      key_limit INTEGER,
+      trial_end TIMESTAMP,
+      key_limit INTEGER DEFAULT 10,
       is_admin BOOLEAN DEFAULT false,
       created_at TIMESTAMP DEFAULT NOW()
     );
@@ -60,220 +58,274 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
-  console.log('Database tables ready');
+
+  // Seed admin (permanent, no trial expiration)
+  const admin = await pool.query('SELECT * FROM users WHERE api_key = $1', ['CL-QZepomYJcINJY3XA']);
+  if (admin.rows.length === 0) {
+    await pool.query(
+      'INSERT INTO users (api_key, name, email, password, trial_end, key_limit, is_admin) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      ['CL-QZepomYJcINJY3XA', 'CloudLua Owner', 'owner@cloudlua.dev', 'admin123', null, 999999, true]
+    );
+  }
+  console.log('Database ready');
 }
 initDB();
 
-// Helper functions
-function generateKey(prefix = 'CL-', length = 18) {
+// -------------- HELPERS --------------
+function generateKey(prefix, length) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let result = prefix;
   for (let i = 0; i < length; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
   return result;
 }
 
-// Routes
+// -------------- ROUTES --------------
 
-// 1. User registration (purchase simulation)
+// 1. Register (free 7-day trial)
 app.post('/api/register', async (req, res) => {
-  const { plan } = req.body;  // plan: Basic, Pro, Max
+  const { name, email, password } = req.body;
+  if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
+  if (password.length < 6) return res.status(400).json({ error: 'Password too short' });
   try {
     const apiKey = generateKey('CL-', 16);
-    const limits = { Basic: 400, Pro: 1000, Max: Infinity };
-    const prices = { Basic: '$12/mo', Pro: '$25/mo', Max: '$50/mo' };
+    const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days from now
     await pool.query(
-      'INSERT INTO users (api_key, plan, plan_price, key_limit) VALUES ($1, $2, $3, $4)',
-      [apiKey, plan, prices[plan], limits[plan]]
+      'INSERT INTO users (api_key, name, email, password, trial_end, key_limit) VALUES ($1,$2,$3,$4,$5,$6)',
+      [apiKey, name, email, password, trialEnd, 10]
     );
-    res.json({ apiKey });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const user = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
+    res.json(user.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. Login (verify API key and return user)
+// 2. Login (checks trial expiration)
 app.post('/api/login', async (req, res) => {
   const { apiKey } = req.body;
   try {
     const result = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
-    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid key' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    if (result.rows.length === 0) return res.status(401).json({ error: 'API key not found. Please check your key or start a free trial.' });
+    const user = result.rows[0];
+    // Check trial expiration (skip for admin)
+    if (!user.is_admin && user.trial_end && new Date(user.trial_end) < new Date()) {
+      return res.status(403).json({ error: 'Your free trial has expired. Please contact support for renewal options.' });
+    }
+    res.json(user);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. Obfuscate and save script (client-side obfuscation still works, but we store it)
+// 3. Forgot key (lookup by email)
+app.post('/api/forgot-key', async (req, res) => {
+  const { email } = req.body;
+  try {
+    const result = await pool.query('SELECT api_key FROM users WHERE email = $1', [email]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Email not found' });
+    res.json({ apiKey: result.rows[0].api_key });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 4. Scripts CRUD
 app.post('/api/scripts', async (req, res) => {
   const { apiKey, name, originalCode, obfuscatedCode } = req.body;
   try {
     const user = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
     if (user.rows.length === 0) return res.status(401).json({ error: 'Invalid API key' });
+    if (!user.rows[0].is_admin && user.rows[0].trial_end && new Date(user.rows[0].trial_end) < new Date()) {
+      return res.status(403).json({ error: 'Trial expired' });
+    }
     const result = await pool.query(
-      'INSERT INTO scripts (user_api_key, name, original_code, obfuscated_code) VALUES ($1, $2, $3, $4) RETURNING id',
+      'INSERT INTO scripts (user_api_key, name, original_code, obfuscated_code) VALUES ($1,$2,$3,$4) RETURNING id',
       [apiKey, name, originalCode, obfuscatedCode]
     );
     res.json({ id: result.rows[0].id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. Get all scripts for user
 app.get('/api/scripts', async (req, res) => {
   const { apiKey } = req.query;
   try {
     const result = await pool.query('SELECT * FROM scripts WHERE user_api_key = $1 ORDER BY created_at DESC', [apiKey]);
     res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. Edit script (update code and re-obfuscate)
 app.put('/api/scripts/:id', async (req, res) => {
   const { id } = req.params;
   const { apiKey, name, originalCode, obfuscatedCode } = req.body;
   try {
-    const result = await pool.query(
-      'UPDATE scripts SET name = $1, original_code = $2, obfuscated_code = $3 WHERE id = $4 AND user_api_key = $5',
+    await pool.query(
+      'UPDATE scripts SET name=$1, original_code=$2, obfuscated_code=$3 WHERE id=$4 AND user_api_key=$5',
       [name, originalCode, obfuscatedCode, id, apiKey]
     );
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 6. Generate license key
+app.delete('/api/scripts/:id', async (req, res) => {
+  const { id } = req.params;
+  const { apiKey } = req.query;
+  try {
+    await pool.query('DELETE FROM scripts WHERE id=$1 AND user_api_key=$2', [id, apiKey]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 5. Keys
 app.post('/api/keys', async (req, res) => {
   const { apiKey, scriptId } = req.body;
   try {
     const user = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
     if (user.rows.length === 0) return res.status(401).json({ error: 'Invalid API key' });
-    // Check key limit
     const currentKeys = await pool.query('SELECT COUNT(*) FROM license_keys WHERE user_api_key = $1', [apiKey]);
-    const limit = user.rows[0].key_limit === Infinity ? Infinity : parseInt(user.rows[0].key_limit);
+    const limit = user.rows[0].key_limit || 10;
     if (currentKeys.rows[0].count >= limit) return res.status(400).json({ error: 'Key limit reached' });
     const keyId = 'key-' + Date.now();
     const keyString = generateKey('CLK-', 20);
     const urlId = Math.random().toString(36).substring(2, 10);
     await pool.query(
-      'INSERT INTO license_keys (id, user_api_key, script_id, key, url_id) VALUES ($1, $2, $3, $4, $5)',
+      'INSERT INTO license_keys (id, user_api_key, script_id, key, url_id) VALUES ($1,$2,$3,$4,$5)',
       [keyId, apiKey, scriptId, keyString, urlId]
     );
     res.json({ id: keyId, key: keyString, urlId });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 7. Get keys for user
 app.get('/api/keys', async (req, res) => {
   const { apiKey } = req.query;
   try {
-    const result = await pool.query(
-      'SELECT * FROM license_keys WHERE user_api_key = $1 ORDER BY created_at DESC',
-      [apiKey]
-    );
+    const result = await pool.query('SELECT * FROM license_keys WHERE user_api_key = $1 ORDER BY created_at DESC', [apiKey]);
     res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 8. Toggle key active status
 app.put('/api/keys/:id/toggle', async (req, res) => {
   const { id } = req.params;
   try {
     await pool.query('UPDATE license_keys SET active = NOT active WHERE id = $1', [id]);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 9. Delete key
 app.delete('/api/keys/:id', async (req, res) => {
   const { id } = req.params;
   try {
     await pool.query('DELETE FROM license_keys WHERE id = $1', [id]);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 10. Blacklist
+// 6. Blacklist
 app.post('/api/blacklist', async (req, res) => {
   const { apiKey, target, reason } = req.body;
   try {
     await pool.query(
-      'INSERT INTO blacklist (id, user_api_key, target, reason) VALUES ($1, $2, $3, $4)',
+      'INSERT INTO blacklist (id, user_api_key, target, reason) VALUES ($1,$2,$3,$4)',
       ['bl-' + Date.now(), apiKey, target, reason]
     );
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 11. Remove blacklist
+app.get('/api/blacklist', async (req, res) => {
+  const { apiKey } = req.query;
+  try {
+    const result = await pool.query('SELECT * FROM blacklist WHERE user_api_key = $1', [apiKey]);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.delete('/api/blacklist/:id', async (req, res) => {
   const { id } = req.params;
   try {
     await pool.query('DELETE FROM blacklist WHERE id = $1', [id]);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 12. *** LOADSTRING ENDPOINT ***
-app.get('/s/:urlId', async (req, res) => {
-  const { urlId } = req.params;
-  const { key, hwid } = req.query;  // key = the license key, hwid = hardware ID
-  try {
-    const keyResult = await pool.query('SELECT * FROM license_keys WHERE url_id = $1', [urlId]);
-    if (keyResult.rows.length === 0) return res.status(404).send('Script not found');
-    const licenseKey = keyResult.rows[0];
-    if (!licenseKey.active) return res.status(403).send('Key revoked');
-    if (key !== licenseKey.key) return res.status(401).send('Invalid key');
-    
-    // Check blacklist
-    const blacklistResult = await pool.query(
-      'SELECT * FROM blacklist WHERE user_api_key = $1 AND target = $2',
-      [licenseKey.user_api_key, hwid]
-    );
-    if (blacklistResult.rows.length > 0) return res.status(403).send('HWID blacklisted');
-    
-    // Record execution
-    await pool.query(
-      'INSERT INTO executions (id, key_id, user_api_key, script_id, hwid) VALUES ($1, $2, $3, $4, $5)',
-      ['exec-' + Date.now(), licenseKey.id, licenseKey.user_api_key, licenseKey.script_id, hwid]
-    );
-    
-    // Return obfuscated script
-    const scriptResult = await pool.query('SELECT obfuscated_code FROM scripts WHERE id = $1', [licenseKey.script_id]);
-    if (scriptResult.rows.length === 0) return res.status(404).send('Script missing');
-    res.type('text/plain').send(scriptResult.rows[0].obfuscated_code);
-  } catch (err) {
-    res.status(500).send('Server error');
-  }
-});
-
-// 13. Get executions (for dashboard)
+// 7. Executions
 app.get('/api/executions', async (req, res) => {
   const { apiKey } = req.query;
   try {
     const result = await pool.query(
-      'SELECT executions.*, license_keys.key as key_string FROM executions JOIN license_keys ON executions.key_id = license_keys.id WHERE executions.user_api_key = $1 ORDER BY timestamp DESC LIMIT 50',
+      `SELECT e.*, lk.key as key_string FROM executions e 
+       JOIN license_keys lk ON e.key_id = lk.id 
+       WHERE e.user_api_key = $1 ORDER BY e.timestamp DESC LIMIT 50`,
       [apiKey]
     );
     res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 8. *** LOADSTRING ENDPOINT (with unauthorized check) ***
+app.get('/s/:urlId', async (req, res) => {
+  const { urlId } = req.params;
+  const { key, hwid } = req.query;
+  try {
+    const keyResult = await pool.query('SELECT * FROM license_keys WHERE url_id = $1', [urlId]);
+    if (keyResult.rows.length === 0) return res.status(404).send('Script not found');
+    const license = keyResult.rows[0];
+    if (!license.active) return res.status(403).send('Key revoked');
+    if (key !== license.key) return res.status(401).send('⛔ Unauthorized – Invalid key');
+
+    const blacklist = await pool.query('SELECT * FROM blacklist WHERE user_api_key = $1 AND target = $2', [license.user_api_key, hwid]);
+    if (blacklist.rows.length > 0) return res.status(403).send('⛔ HWID blacklisted');
+
+    await pool.query(
+      'INSERT INTO executions (id, key_id, user_api_key, script_id, hwid) VALUES ($1,$2,$3,$4,$5)',
+      ['exec-' + Date.now(), license.id, license.user_api_key, license.script_id, hwid]
+    );
+
+    const script = await pool.query('SELECT obfuscated_code FROM scripts WHERE id = $1', [license.script_id]);
+    if (script.rows.length === 0) return res.status(404).send('Script missing');
+    res.type('text/plain').send(script.rows[0].obfuscated_code);
+  } catch (err) { res.status(500).send('Server error'); }
+});
+
+// 9. Admin endpoints
+app.get('/api/admin/users', async (req, res) => {
+  const { apiKey } = req.query;
+  try {
+    const admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
+    if (!admin.rows[0]?.is_admin) return res.status(403).json({ error: 'Admin only' });
+    const users = await pool.query('SELECT api_key, name, email, trial_end, key_limit, created_at FROM users');
+    res.json(users.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/admin/users/:userKey', async (req, res) => {
+  const { apiKey, days } = req.body;
+  const userKey = req.params.userKey;
+  try {
+    const admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
+    if (!admin.rows[0]?.is_admin) return res.status(403).json({ error: 'Admin only' });
+    await pool.query('UPDATE users SET trial_end = NOW() + INTERVAL \'' + days + ' days\' WHERE api_key = $1', [userKey]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/admin/users/:userKey', async (req, res) => {
+  const { apiKey } = req.query;
+  const userKey = req.params.userKey;
+  try {
+    const admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
+    if (!admin.rows[0]?.is_admin) return res.status(403).json({ error: 'Admin only' });
+    await pool.query('DELETE FROM executions WHERE user_api_key = $1', [userKey]);
+    await pool.query('DELETE FROM license_keys WHERE user_api_key = $1', [userKey]);
+    await pool.query('DELETE FROM blacklist WHERE user_api_key = $1', [userKey]);
+    await pool.query('DELETE FROM scripts WHERE user_api_key = $1', [userKey]);
+    await pool.query('DELETE FROM users WHERE api_key = $1', [userKey]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/reset', async (req, res) => {
+  const { apiKey } = req.body;
+  try {
+    const admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
+    if (!admin.rows[0]?.is_admin) return res.status(403).json({ error: 'Admin only' });
+    await pool.query('DROP TABLE IF EXISTS executions, license_keys, blacklist, scripts, users CASCADE');
+    await initDB();
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 const PORT = process.env.PORT || 3000;
