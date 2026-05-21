@@ -12,6 +12,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// -------------- DB INIT --------------
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -56,8 +57,17 @@ async function initDB() {
       reason TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS support (
+      id SERIAL PRIMARY KEY,
+      user_api_key TEXT,
+      subject TEXT,
+      message TEXT,
+      reply TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
   `);
 
+  // Seed admin
   const admin = await pool.query('SELECT * FROM users WHERE api_key = $1', ['CL-QZepomYJcINJY3XA']);
   if (admin.rows.length === 0) {
     await pool.query(
@@ -69,37 +79,42 @@ async function initDB() {
 }
 initDB();
 
+// -------------- HELPERS --------------
 function generateKey(prefix, length) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let result = prefix;
-  for (let i = 0; i < length; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+  var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  var result = prefix;
+  for (var i = 0; i < length; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
   return result;
 }
 
-// Register
+// -------------- ROUTES --------------
+
+// 1. Register (free 7-day trial)
 app.post('/api/register', async (req, res) => {
-  const { name, email, password } = req.body;
+  var name = req.body.name;
+  var email = req.body.email;
+  var password = req.body.password;
   if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
   if (password.length < 6) return res.status(400).json({ error: 'Password too short' });
   try {
-    const apiKey = generateKey('CL-', 16);
-    const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    var apiKey = generateKey('CL-', 16);
+    var trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     await pool.query(
       'INSERT INTO users (api_key, name, email, password, trial_end, key_limit) VALUES ($1,$2,$3,$4,$5,$6)',
       [apiKey, name, email, password, trialEnd, 10]
     );
-    const user = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
+    var user = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
     res.json(user.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Login
+// 2. Login
 app.post('/api/login', async (req, res) => {
-  const { apiKey } = req.body;
+  var apiKey = req.body.apiKey;
   try {
-    const result = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
+    var result = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
     if (result.rows.length === 0) return res.status(401).json({ error: 'API key not found' });
-    const user = result.rows[0];
+    var user = result.rows[0];
     if (!user.is_admin && user.trial_end && new Date(user.trial_end) < new Date()) {
       return res.status(403).json({ error: 'Trial expired' });
     }
@@ -107,21 +122,24 @@ app.post('/api/login', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Forgot key
+// 3. Forgot key
 app.post('/api/forgot-key', async (req, res) => {
-  const { email } = req.body;
+  var email = req.body.email;
   try {
-    const result = await pool.query('SELECT api_key FROM users WHERE email = $1', [email]);
+    var result = await pool.query('SELECT api_key FROM users WHERE email = $1', [email]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Email not found' });
     res.json({ apiKey: result.rows[0].api_key });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Scripts CRUD
+// 4. Scripts CRUD
 app.post('/api/scripts', async (req, res) => {
-  const { apiKey, name, originalCode, obfuscatedCode } = req.body;
+  var apiKey = req.body.apiKey;
+  var name = req.body.name;
+  var originalCode = req.body.originalCode;
+  var obfuscatedCode = req.body.obfuscatedCode;
   try {
-    const result = await pool.query(
+    var result = await pool.query(
       'INSERT INTO scripts (user_api_key, name, original_code, obfuscated_code) VALUES ($1,$2,$3,$4) RETURNING id',
       [apiKey, name, originalCode, obfuscatedCode]
     );
@@ -130,16 +148,19 @@ app.post('/api/scripts', async (req, res) => {
 });
 
 app.get('/api/scripts', async (req, res) => {
-  const { apiKey } = req.query;
+  var apiKey = req.query.apiKey;
   try {
-    const result = await pool.query('SELECT * FROM scripts WHERE user_api_key = $1 ORDER BY created_at DESC', [apiKey]);
+    var result = await pool.query('SELECT * FROM scripts WHERE user_api_key = $1 ORDER BY created_at DESC', [apiKey]);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.put('/api/scripts/:id', async (req, res) => {
-  const { id } = req.params;
-  const { apiKey, name, originalCode, obfuscatedCode } = req.body;
+  var id = req.params.id;
+  var apiKey = req.body.apiKey;
+  var name = req.body.name;
+  var originalCode = req.body.originalCode;
+  var obfuscatedCode = req.body.obfuscatedCode;
   try {
     await pool.query(
       'UPDATE scripts SET name=$1, original_code=$2, obfuscated_code=$3 WHERE id=$4 AND user_api_key=$5',
@@ -150,44 +171,45 @@ app.put('/api/scripts/:id', async (req, res) => {
 });
 
 app.delete('/api/scripts/:id', async (req, res) => {
-  const { id } = req.params;
-  const { apiKey } = req.query;
+  var id = req.params.id;
+  var apiKey = req.query.apiKey;
   try {
     await pool.query('DELETE FROM scripts WHERE id=$1 AND user_api_key=$2', [id, apiKey]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Keys
+// 5. Keys
 app.post('/api/keys', async (req, res) => {
-  const { apiKey, scriptId } = req.body;
+  var apiKey = req.body.apiKey;
+  var scriptId = req.body.scriptId;
   try {
-    const user = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
+    var user = await pool.query('SELECT * FROM users WHERE api_key = $1', [apiKey]);
     if (user.rows.length === 0) return res.status(401).json({ error: 'Invalid API key' });
-    const currentKeys = await pool.query('SELECT COUNT(*) FROM license_keys WHERE user_api_key = $1', [apiKey]);
-    const limit = user.rows[0].key_limit || 10;
+    var currentKeys = await pool.query('SELECT COUNT(*) FROM license_keys WHERE user_api_key = $1', [apiKey]);
+    var limit = user.rows[0].key_limit || 10;
     if (currentKeys.rows[0].count >= limit) return res.status(400).json({ error: 'Key limit reached' });
-    const keyId = 'key-' + Date.now();
-    const keyString = generateKey('CLK-', 20);
-    const urlId = Math.random().toString(36).substring(2, 10);
+    var keyId = 'key-' + Date.now();
+    var keyString = generateKey('CLK-', 20);
+    var urlId = Math.random().toString(36).substring(2, 10);
     await pool.query(
       'INSERT INTO license_keys (id, user_api_key, script_id, key, url_id) VALUES ($1,$2,$3,$4,$5)',
       [keyId, apiKey, scriptId, keyString, urlId]
     );
-    res.json({ id: keyId, key: keyString, urlId });
+    res.json({ id: keyId, key: keyString, urlId: urlId });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/keys', async (req, res) => {
-  const { apiKey } = req.query;
+  var apiKey = req.query.apiKey;
   try {
-    const result = await pool.query('SELECT * FROM license_keys WHERE user_api_key = $1 ORDER BY created_at DESC', [apiKey]);
+    var result = await pool.query('SELECT * FROM license_keys WHERE user_api_key = $1 ORDER BY created_at DESC', [apiKey]);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.put('/api/keys/:id/toggle', async (req, res) => {
-  const { id } = req.params;
+  var id = req.params.id;
   try {
     await pool.query('UPDATE license_keys SET active = NOT active WHERE id = $1', [id]);
     res.json({ success: true });
@@ -195,16 +217,18 @@ app.put('/api/keys/:id/toggle', async (req, res) => {
 });
 
 app.delete('/api/keys/:id', async (req, res) => {
-  const { id } = req.params;
+  var id = req.params.id;
   try {
     await pool.query('DELETE FROM license_keys WHERE id = $1', [id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Blacklist
+// 6. Blacklist
 app.post('/api/blacklist', async (req, res) => {
-  const { apiKey, target, reason } = req.body;
+  var apiKey = req.body.apiKey;
+  var target = req.body.target;
+  var reason = req.body.reason;
   try {
     await pool.query(
       'INSERT INTO blacklist (id, user_api_key, target, reason) VALUES ($1,$2,$3,$4)',
@@ -215,85 +239,110 @@ app.post('/api/blacklist', async (req, res) => {
 });
 
 app.get('/api/blacklist', async (req, res) => {
-  const { apiKey } = req.query;
+  var apiKey = req.query.apiKey;
   try {
-    const result = await pool.query('SELECT * FROM blacklist WHERE user_api_key = $1', [apiKey]);
+    var result = await pool.query('SELECT * FROM blacklist WHERE user_api_key = $1', [apiKey]);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.delete('/api/blacklist/:id', async (req, res) => {
-  const { id } = req.params;
+  var id = req.params.id;
   try {
     await pool.query('DELETE FROM blacklist WHERE id = $1', [id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Executions
+// 7. Executions
 app.get('/api/executions', async (req, res) => {
-  const { apiKey } = req.query;
+  var apiKey = req.query.apiKey;
   try {
-    const result = await pool.query(
-      `SELECT e.*, lk.key as key_string FROM executions e 
-       JOIN license_keys lk ON e.key_id = lk.id 
-       WHERE e.user_api_key = $1 ORDER BY e.timestamp DESC LIMIT 50`,
+    var result = await pool.query(
+      'SELECT e.*, lk.key as key_string FROM executions e JOIN license_keys lk ON e.key_id = lk.id WHERE e.user_api_key = $1 ORDER BY e.timestamp DESC LIMIT 50',
       [apiKey]
     );
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Loadstring
+// 8. Loadstring endpoint
 app.get('/s/:urlId', async (req, res) => {
-  const { urlId } = req.params;
-  const { key, hwid } = req.query;
+  var urlId = req.params.urlId;
+  var key = req.query.key;
+  var hwid = req.query.hwid;
   try {
-    const keyResult = await pool.query('SELECT * FROM license_keys WHERE url_id = $1', [urlId]);
+    var keyResult = await pool.query('SELECT * FROM license_keys WHERE url_id = $1', [urlId]);
     if (keyResult.rows.length === 0) return res.status(404).send('Script not found');
-    const license = keyResult.rows[0];
+    var license = keyResult.rows[0];
     if (!license.active) return res.status(403).send('Key revoked');
     if (key !== license.key) return res.status(401).send('Unauthorized — invalid key');
-    const bl = await pool.query('SELECT * FROM blacklist WHERE user_api_key = $1 AND target = $2', [license.user_api_key, hwid]);
+
+    var bl = await pool.query('SELECT * FROM blacklist WHERE user_api_key = $1 AND target = $2', [license.user_api_key, hwid]);
     if (bl.rows.length > 0) return res.status(403).send('HWID blacklisted');
+
     await pool.query(
       'INSERT INTO executions (id, key_id, user_api_key, script_id, hwid) VALUES ($1,$2,$3,$4,$5)',
       ['exec-' + Date.now(), license.id, license.user_api_key, license.script_id, hwid]
     );
-    const script = await pool.query('SELECT obfuscated_code FROM scripts WHERE id = $1', [license.script_id]);
+
+    var script = await pool.query('SELECT obfuscated_code FROM scripts WHERE id = $1', [license.script_id]);
     if (script.rows.length === 0) return res.status(404).send('Script missing');
     res.type('text/plain').send(script.rows[0].obfuscated_code);
   } catch (err) { res.status(500).send('Server error'); }
 });
 
-// Admin
-app.get('/api/admin/users', async (req, res) => {
-  const { apiKey } = req.query;
+// 9. Support tickets
+app.post('/api/support', async (req, res) => {
+  var apiKey = req.body.apiKey;
+  var subject = req.body.subject;
+  var message = req.body.message;
   try {
-    const admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
-    if (!admin.rows[0]?.is_admin) return res.status(403).json({ error: 'Admin only' });
-    const users = await pool.query('SELECT api_key, name, email, trial_end, key_limit, created_at FROM users');
+    await pool.query(
+      'INSERT INTO support (user_api_key, subject, message) VALUES ($1, $2, $3)',
+      [apiKey, subject, message]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/support', async (req, res) => {
+  var apiKey = req.query.apiKey;
+  try {
+    var result = await pool.query('SELECT * FROM support WHERE user_api_key = $1 ORDER BY created_at DESC', [apiKey]);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 10. Admin routes
+app.get('/api/admin/users', async (req, res) => {
+  var apiKey = req.query.apiKey;
+  try {
+    var admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
+    if (!admin.rows[0] || !admin.rows[0].is_admin) return res.status(403).json({ error: 'Admin only' });
+    var users = await pool.query('SELECT api_key, name, email, trial_end, key_limit, created_at FROM users');
     res.json(users.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.put('/api/admin/users/:userKey', async (req, res) => {
-  const { apiKey, days } = req.body;
-  const userKey = req.params.userKey;
+  var apiKey = req.body.apiKey;
+  var days = req.body.days;
+  var userKey = req.params.userKey;
   try {
-    const admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
-    if (!admin.rows[0]?.is_admin) return res.status(403).json({ error: 'Admin only' });
+    var admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
+    if (!admin.rows[0] || !admin.rows[0].is_admin) return res.status(403).json({ error: 'Admin only' });
     await pool.query('UPDATE users SET trial_end = NOW() + INTERVAL \'' + days + ' days\' WHERE api_key = $1', [userKey]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.delete('/api/admin/users/:userKey', async (req, res) => {
-  const { apiKey } = req.query;
-  const userKey = req.params.userKey;
+  var apiKey = req.query.apiKey;
+  var userKey = req.params.userKey;
   try {
-    const admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
-    if (!admin.rows[0]?.is_admin) return res.status(403).json({ error: 'Admin only' });
+    var admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
+    if (!admin.rows[0] || !admin.rows[0].is_admin) return res.status(403).json({ error: 'Admin only' });
     await pool.query('DELETE FROM executions WHERE user_api_key = $1', [userKey]);
     await pool.query('DELETE FROM license_keys WHERE user_api_key = $1', [userKey]);
     await pool.query('DELETE FROM blacklist WHERE user_api_key = $1', [userKey]);
@@ -304,15 +353,38 @@ app.delete('/api/admin/users/:userKey', async (req, res) => {
 });
 
 app.post('/api/admin/reset', async (req, res) => {
-  const { apiKey } = req.body;
+  var apiKey = req.body.apiKey;
   try {
-    const admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
-    if (!admin.rows[0]?.is_admin) return res.status(403).json({ error: 'Admin only' });
-    await pool.query('DROP TABLE IF EXISTS executions, license_keys, blacklist, scripts, users CASCADE');
+    var admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
+    if (!admin.rows[0] || !admin.rows[0].is_admin) return res.status(403).json({ error: 'Admin only' });
+    await pool.query('DROP TABLE IF EXISTS executions, license_keys, blacklist, scripts, support, users CASCADE');
     await initDB();
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`CloudLua backend running on port ${PORT}`));
+// Admin support
+app.get('/api/admin/support', async (req, res) => {
+  var apiKey = req.query.apiKey;
+  try {
+    var admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
+    if (!admin.rows[0] || !admin.rows[0].is_admin) return res.status(403).json({ error: 'Admin only' });
+    var result = await pool.query('SELECT * FROM support ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/admin/support/:id', async (req, res) => {
+  var apiKey = req.body.apiKey;
+  var reply = req.body.reply;
+  var ticketId = req.params.id;
+  try {
+    var admin = await pool.query('SELECT is_admin FROM users WHERE api_key = $1', [apiKey]);
+    if (!admin.rows[0] || !admin.rows[0].is_admin) return res.status(403).json({ error: 'Admin only' });
+    await pool.query('UPDATE support SET reply = $1 WHERE id = $2', [reply, ticketId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+var PORT = process.env.PORT || 3000;
+app.listen(PORT, function() { console.log('CloudLua backend running on port ' + PORT); });
