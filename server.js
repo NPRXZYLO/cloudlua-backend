@@ -1,4 +1,4 @@
-cat > /mnt/user-data/outputs/server.js << 'SERVEREOF'
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -524,4 +524,3 @@ app.post('/api/admin/reset', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[CloudLua] Backend running on port ${PORT}`));
 SERVEREOF
-echo "server.js written"
