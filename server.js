@@ -5,14 +5,13 @@ const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// -------------- DB INIT --------------
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -67,7 +66,6 @@ async function initDB() {
     );
   `);
 
-  // Seed admin
   const admin = await pool.query('SELECT * FROM users WHERE api_key = $1', ['CL-QZepomYJcINJY3XA']);
   if (admin.rows.length === 0) {
     await pool.query(
@@ -79,7 +77,6 @@ async function initDB() {
 }
 initDB();
 
-// -------------- HELPERS --------------
 function generateKey(prefix, length) {
   var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   var result = prefix;
@@ -87,9 +84,7 @@ function generateKey(prefix, length) {
   return result;
 }
 
-// -------------- ROUTES --------------
-
-// 1. Register (free 7-day trial)
+// Register
 app.post('/api/register', async (req, res) => {
   var name = req.body.name;
   var email = req.body.email;
@@ -108,7 +103,7 @@ app.post('/api/register', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. Login
+// Login
 app.post('/api/login', async (req, res) => {
   var apiKey = req.body.apiKey;
   try {
@@ -122,7 +117,7 @@ app.post('/api/login', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. Forgot key
+// Forgot key
 app.post('/api/forgot-key', async (req, res) => {
   var email = req.body.email;
   try {
@@ -132,7 +127,7 @@ app.post('/api/forgot-key', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. Scripts CRUD
+// Scripts CRUD
 app.post('/api/scripts', async (req, res) => {
   var apiKey = req.body.apiKey;
   var name = req.body.name;
@@ -179,7 +174,7 @@ app.delete('/api/scripts/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. Keys
+// Keys
 app.post('/api/keys', async (req, res) => {
   var apiKey = req.body.apiKey;
   var scriptId = req.body.scriptId;
@@ -224,7 +219,7 @@ app.delete('/api/keys/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 6. Blacklist
+// Blacklist
 app.post('/api/blacklist', async (req, res) => {
   var apiKey = req.body.apiKey;
   var target = req.body.target;
@@ -254,7 +249,7 @@ app.delete('/api/blacklist/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 7. Executions
+// Executions
 app.get('/api/executions', async (req, res) => {
   var apiKey = req.query.apiKey;
   try {
@@ -266,20 +261,20 @@ app.get('/api/executions', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 8. Loadstring endpoint
+// ★★★ LOADSTRING ENDPOINT ★★★
 app.get('/s/:urlId', async (req, res) => {
   var urlId = req.params.urlId;
   var key = req.query.key;
-  var hwid = req.query.hwid;
+  var hwid = req.query.hwid || 'unknown';
   try {
     var keyResult = await pool.query('SELECT * FROM license_keys WHERE url_id = $1', [urlId]);
-    if (keyResult.rows.length === 0) return res.status(404).send('Script not found');
+    if (keyResult.rows.length === 0) return res.status(404).send('-- CloudLua: Script not found');
     var license = keyResult.rows[0];
-    if (!license.active) return res.status(403).send('Key revoked');
-    if (key !== license.key) return res.status(401).send('Unauthorized — invalid key');
+    if (!license.active) return res.status(403).send('-- CloudLua: Key revoked');
+    if (key !== license.key) return res.status(401).send('-- CloudLua: Unauthorized - invalid key');
 
     var bl = await pool.query('SELECT * FROM blacklist WHERE user_api_key = $1 AND target = $2', [license.user_api_key, hwid]);
-    if (bl.rows.length > 0) return res.status(403).send('HWID blacklisted');
+    if (bl.rows.length > 0) return res.status(403).send('-- CloudLua: HWID blacklisted');
 
     await pool.query(
       'INSERT INTO executions (id, key_id, user_api_key, script_id, hwid) VALUES ($1,$2,$3,$4,$5)',
@@ -287,21 +282,20 @@ app.get('/s/:urlId', async (req, res) => {
     );
 
     var script = await pool.query('SELECT obfuscated_code FROM scripts WHERE id = $1', [license.script_id]);
-    if (script.rows.length === 0) return res.status(404).send('Script missing');
-    res.type('text/plain').send(script.rows[0].obfuscated_code);
-  } catch (err) { res.status(500).send('Server error'); }
+    if (script.rows.length === 0) return res.status(404).send('-- CloudLua: Script missing');
+    
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.send(script.rows[0].obfuscated_code);
+  } catch (err) { res.status(500).send('-- CloudLua: Server error'); }
 });
 
-// 9. Support tickets
+// Support
 app.post('/api/support', async (req, res) => {
   var apiKey = req.body.apiKey;
   var subject = req.body.subject;
   var message = req.body.message;
   try {
-    await pool.query(
-      'INSERT INTO support (user_api_key, subject, message) VALUES ($1, $2, $3)',
-      [apiKey, subject, message]
-    );
+    await pool.query('INSERT INTO support (user_api_key, subject, message) VALUES ($1,$2,$3)', [apiKey, subject, message]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -314,7 +308,7 @@ app.get('/api/support', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 10. Admin routes
+// Admin
 app.get('/api/admin/users', async (req, res) => {
   var apiKey = req.query.apiKey;
   try {
@@ -346,6 +340,7 @@ app.delete('/api/admin/users/:userKey', async (req, res) => {
     await pool.query('DELETE FROM executions WHERE user_api_key = $1', [userKey]);
     await pool.query('DELETE FROM license_keys WHERE user_api_key = $1', [userKey]);
     await pool.query('DELETE FROM blacklist WHERE user_api_key = $1', [userKey]);
+    await pool.query('DELETE FROM support WHERE user_api_key = $1', [userKey]);
     await pool.query('DELETE FROM scripts WHERE user_api_key = $1', [userKey]);
     await pool.query('DELETE FROM users WHERE api_key = $1', [userKey]);
     res.json({ success: true });
@@ -363,7 +358,6 @@ app.post('/api/admin/reset', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Admin support
 app.get('/api/admin/support', async (req, res) => {
   var apiKey = req.query.apiKey;
   try {
