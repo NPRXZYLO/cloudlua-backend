@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -523,4 +522,3 @@ app.post('/api/admin/reset', async (req, res) => {
 // ─── START ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[CloudLua] Backend running on port ${PORT}`));
-SERVEREOF
